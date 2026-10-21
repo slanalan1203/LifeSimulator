@@ -8,8 +8,11 @@ func (c *Colony) chooseWork(workerIndex int) resources.Resource {
 
 	food := c.storage[resources.Food]
 	wood := c.storage[resources.Wood]
-	people := len(c.colonists)
+	people := c.aliveCountLocked()
 	col := &c.colonists[workerIndex]
+	if col.Dead || col.Age < 18 {
+		return resources.NotSet
+	}
 
 	foodLow := max(10, people*4)
 	foodHigh := max(12, people*12)

@@ -63,10 +63,10 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 				list.SetItemText(i, label, "")
 			}
 		}
-		total := len(snapshot.Colonists)
+		total := snapshot.Population
 		busy := 0
 		for _, col := range snapshot.Colonists {
-			if col.Busy {
+			if !col.Dead && col.Busy {
 				busy++
 			}
 		}
@@ -83,9 +83,9 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 		consumed := snapshot.FoodConsumedLastMinute
 
 		village.SetText(fmt.Sprintf(
-			"Жители: [green]%d[-]   Заняты: %d   Свободны: %d\n"+
+			"Жители: [green]%d[-]   Заняты: %d   Не заняты: %d\n"+
 				"Еда: [yellow]%d[-]   Дерево: [yellow]%d[-]   Дома: %d   Мест: %d   Погода: [cyan]%s[-]\n"+
-				"Еда за 60 с: добыто [green]%d[-]   съедено [yellow]%d[-]   баланс: %+d\n"+
+				"Еда за 60 с: добыто [green]%d[-]   потрачено [yellow]%d[-]   баланс: %+d\n"+
 				"Запас без новой добычи: %s",
 			total, busy, total-busy,
 			snapshot.Food, snapshot.Wood,
@@ -151,7 +151,7 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 	list.SetChangedFunc(onSelect)
 	list.SetSelectedFunc(onSelect)
 
-	notice := tview.NewTextView().SetText("Поручения выполняет любой житель деревни.")
+	notice := tview.NewTextView().SetText("Поручения выполняют взрослые жители деревни.")
 
 	sendJob := func(resource resources.Resource) {
 		select {
@@ -277,6 +277,12 @@ func levelColor(level int) string {
 }
 
 func colonistLabel(col Colonist.Colonist) string {
+	if col.Dead {
+		return fmt.Sprintf("[gray]%s (умер)[-]", tview.Escape(col.Name))
+	}
+	if col.Age < 18 {
+		return fmt.Sprintf("[cyan]%s (%d, ребёнок)[-]", tview.Escape(col.Name), col.Age)
+	}
 	level := col.Level()
 
 	return fmt.Sprintf(

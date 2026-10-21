@@ -38,7 +38,10 @@ func main() {
 
 	var wg sync.WaitGroup
 	initialSnaphot := c.Snapshot()
-	for i := range initialSnaphot.Colonists {
+	for i, col := range initialSnaphot.Colonists {
+		if col.Dead {
+			continue
+		}
 		wg.Go(func() {
 			c.Live(ctx, i, jobs)
 		})
@@ -53,7 +56,22 @@ func main() {
 	})
 
 	wg.Go(func() {
-		c.AgingLoop(stop)
+		c.AgingLoop(stop, func() {
+			if ctx.Err() != nil || !c.CanHaveChild() || rand.Float64() >= 0.25 {
+				return
+			}
+			name, err := namegen.Random(ctx)
+			if err != nil || ctx.Err() != nil {
+				return
+			}
+			index, ok := c.TryBirth(name)
+			if !ok {
+				return
+			}
+			wg.Go(func() {
+				c.Live(ctx, index, jobs)
+			})
+		})
 	})
 
 	wg.Go(func() {
@@ -67,7 +85,7 @@ func main() {
 			case <-ticker.C:
 				snapshot := c.Snapshot()
 
-				if len(snapshot.Colonists) >= snapshot.Capacity || snapshot.Food < 10 {
+				if snapshot.Population >= snapshot.Capacity || snapshot.Food < 10 {
 					continue
 				}
 				if rand.IntN(2) != 0 {

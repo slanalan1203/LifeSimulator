@@ -23,6 +23,8 @@ type villageResponse struct {
 }
 
 type colonistResponse struct {
+	Age              int    `json:"age"`
+	Dead             bool   `json:"dead"`
 	ID               int    `json:"id"`
 	Name             string `json:"name"`
 	Busy             bool   `json:"busy"`
@@ -48,7 +50,7 @@ func NewHandler(c *colony.Colony, jobs chan<- colony.Job) http.Handler {
 			snapshot := c.Snapshot()
 
 			response := villageResponse{
-				Population: len(snapshot.Colonists),
+				Population: snapshot.Population,
 				Food:       snapshot.Food,
 				Wood:       snapshot.Wood,
 				Houses:     snapshot.Houses,
@@ -81,6 +83,8 @@ func NewHandler(c *colony.Colony, jobs chan<- colony.Job) http.Handler {
 			}
 			for _, col := range snapshot.Colonists {
 				response.Colonists = append(response.Colonists, colonistResponse{
+					Age:              col.Age,
+					Dead:             col.Dead,
 					ID:               col.ID,
 					Name:             col.Name,
 					Busy:             col.Busy,
@@ -117,6 +121,8 @@ func NewHandler(c *colony.Colony, jobs chan<- colony.Job) http.Handler {
 				}
 
 				response := colonistResponse{
+					Age:              col.Age,
+					Dead:             col.Dead,
 					ID:               col.ID,
 					Name:             col.Name,
 					Busy:             col.Busy,

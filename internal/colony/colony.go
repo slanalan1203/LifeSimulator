@@ -61,6 +61,8 @@ type Snapshot struct {
 	FoodReserveMinutes     float64
 
 	ConstructionAllowed bool
+
+	Population int
 }
 
 type Job struct {
@@ -255,11 +257,12 @@ func (c *Colony) Live(ctx context.Context, workerIndex int, jobs <-chan Job) {
 			return
 		}
 		if isChild {
-			c.startAction(workerIndex, "играет", 2 * time.Second)
+			c.startAction(workerIndex, "играет", 2*time.Second)
 
 			if err := waitForAction(ctx, 2*time.Second); err != nil {
 				return
 			}
+			continue
 		}
 		select {
 		case job, ok := <-jobs:
@@ -392,7 +395,8 @@ func (c *Colony) Eat(workerIndex int) {
 func (c *Colony) TryBuildHouse(workerIndex int, stop <-chan struct{}) bool {
 	duration := 30 * time.Second
 	c.mu.Lock()
-	freePlaces := c.houses*residentPerHouse - len(c.colonists)
+	people := c.aliveCountLocked()
+	freePlaces := c.houses*residentPerHouse - people
 	col := &c.colonists[workerIndex]
 
 	if col.Dead ||
@@ -400,7 +404,7 @@ func (c *Colony) TryBuildHouse(workerIndex int, stop <-chan struct{}) bool {
 		!c.allowConstruction ||
 		c.buildingHouse ||
 		freePlaces > 1 ||
-		c.storage[resources.Food] < len(c.colonists) ||
+		c.storage[resources.Food] < people ||
 		c.storage[resources.Wood] < houseWoodCost ||
 		col.Busy ||
 		col.Fatigue >= 75 ||
@@ -486,6 +490,7 @@ func (c *Colony) Snapshot() Snapshot {
 	producedLastMinute := 0
 	consumedLastMinute := 0
 	cutoff := time.Now().Add(-time.Minute)
+
 	for _, change := range c.foodHistory {
 		if change.at.After(cutoff) {
 			producedLastMinute += change.produced
@@ -493,20 +498,24 @@ func (c *Colony) Snapshot() Snapshot {
 		}
 	}
 
-	foodPerMinute := float64(len(c.colonists)) * 2
+	population := c.aliveCountLocked()
+	foodPerMinute := float64(population) * 2
 	reserveMinutes := 0.0
+
 	if foodPerMinute > 0 {
 		reserveMinutes = float64(c.storage[resources.Food]) / foodPerMinute
 	}
+
 	c.eventsMu.Lock()
 	defer c.eventsMu.Unlock()
 
 	return Snapshot{
-		Colonists: append([]Colonist.Colonist{}, c.colonists...),
-		Food:      c.storage[resources.Food],
-		Wood:      c.storage[resources.Wood],
-		Houses:    c.houses,
-		Capacity:  c.houses * residentPerHouse,
+		Population: population,
+		Colonists:  append([]Colonist.Colonist{}, c.colonists...),
+		Food:       c.storage[resources.Food],
+		Wood:       c.storage[resources.Wood],
+		Houses:     c.houses,
+		Capacity:   c.houses * residentPerHouse,
 
 		Events: append([]string{}, c.events...),
 
@@ -516,8 +525,8 @@ func (c *Colony) Snapshot() Snapshot {
 		FoodProduced: c.foodProduced,
 
 		FoodConsumedLastMinute: consumedLastMinute,
-		FoodReserveMinutes:     reserveMinutes,
 		FoodProducedLastMinute: producedLastMinute,
+		FoodReserveMinutes:     reserveMinutes,
 
 		ConstructionAllowed: c.allowConstruction,
 	}
@@ -553,7 +562,7 @@ func (c *Colony) TryAddColonist(name string) (int, bool) {
 	defer c.mu.Unlock()
 
 	capacity := c.houses * residentPerHouse
-	if len(c.colonists) >= capacity || c.storage[resources.Food] < 10 {
+	if c.aliveCountLocked() >= capacity || c.storage[resources.Food] < 10 {
 		return -1, false
 	}
 

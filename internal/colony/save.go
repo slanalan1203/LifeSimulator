@@ -25,7 +25,7 @@ func (c *Colony) Save(path string) error {
 	snapshot := c.Snapshot()
 
 	data := &saveData{
-		Version:             2,
+		Version:             3,
 		Colonist:            snapshot.Colonists,
 		Food:                snapshot.Food,
 		Wood:                snapshot.Wood,
@@ -68,7 +68,7 @@ func Load(path string) (*Colony, error) {
 		for i := range data.Colonist {
 			data.Colonist[i].Age = 18
 		}
-	case 2:
+	case 2, 3:
 	default:
 		return nil, fmt.Errorf("неподдерживаемая версия: %d", data.Version)
 	}
@@ -86,10 +86,20 @@ func Load(path string) (*Colony, error) {
 
 	for i := range data.Colonist {
 		col := &data.Colonist[i]
+		if col.Age < 0 {
+			return nil, fmt.Errorf("отрицательный возраст жителя: %d", col.ID)
+		}
 
 		col.Busy = false
 		col.EmployType = resources.NotSet
-		col.Action = "свободен"
+		switch {
+		case col.Dead:
+			col.Action = "умер"
+		case col.Age < 18:
+			col.Action = "играет"
+		default:
+			col.Action = "свободен"
+		}
 		col.ActionStartedAt = time.Time{}
 		col.ActionDuration = 0
 	}
