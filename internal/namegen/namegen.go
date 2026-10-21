@@ -1,6 +1,7 @@
 package namegen
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,21 +9,23 @@ import (
 	"time"
 )
 
-func Random() (string, error) {
+func Random(ctx context.Context) (string, error) {
 	client := &http.Client{
 		Timeout: 5 * time.Second,
 	}
 
-	resp, err := client.Get(
-		"https://randomuser.me/api/1.4/?inc=name&nat=us,gb&noinfo",
-	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://randomuser.me/api/1.4/?inc=name&nat=us,gb&noinfo", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("Сервис имен: %s", resp.Status)
+		return "", fmt.Errorf("сервис имен: %s", resp.Status)
 	}
 
 	var data struct {

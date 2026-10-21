@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"lifeSimulator/internal/Colonist"
 	"lifeSimulator/internal/colony"
 	"lifeSimulator/internal/resources"
 	"strings"
@@ -26,6 +27,7 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 	list := tview.NewList().ShowSecondaryText(false)
 	list.SetBorder(true).SetTitle(" Жители ")
 	list.SetBorderColor(tcell.ColorGreen)
+	list.SetSelectedBackgroundColor(tcell.ColorDarkSlateGray)
 
 	details := tview.NewTextView().SetDynamicColors(true)
 	details.SetBorder(true).SetTitle(" Карточка Жителя ")
@@ -44,12 +46,22 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 	village.SetBorder(true).SetTitle(" Деревня ")
 	village.SetBorderColor(tcell.ColorGreen)
 
+	constructionButton := tview.NewButton("Приостановить стройку")
 	show := func(index int) {
 		snapshot = c.Snapshot()
-		for list.GetItemCount() < len(snapshot.Colonists) {
-			i := list.GetItemCount()
-			col := snapshot.Colonists[i]
-			list.AddItem(col.Name, "", 0, nil)
+		if snapshot.ConstructionAllowed {
+			constructionButton.SetLabel("Приостановить стройку")
+		} else {
+			constructionButton.SetLabel("Разрешить стройку")
+		}
+		for i, col := range snapshot.Colonists {
+			label := colonistLabel(col)
+
+			if i >= list.GetItemCount() {
+				list.AddItem(label, "", 0, nil)
+			} else {
+				list.SetItemText(i, label, "")
+			}
 		}
 		total := len(snapshot.Colonists)
 		busy := 0
@@ -58,15 +70,28 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 				busy++
 			}
 		}
-		house := "нет"
-		if snapshot.HasHouse {
-			house = "построен"
+
+		reserveText := "—"
+		if total > 0 {
+			reserveText = fmt.Sprintf(
+				"примерно %.1f мин",
+				snapshot.FoodReserveMinutes,
+			)
 		}
+
+		produced := snapshot.FoodProducedLastMinute
+		consumed := snapshot.FoodConsumedLastMinute
+
 		village.SetText(fmt.Sprintf(
 			"Жители: [green]%d[-]   Заняты: %d   Свободны: %d\n"+
-				"Еда: [yellow]%d[-]   Дерево: [yellow]%d[-]   Дом: %s   Погода: [cyan]%s[-]",
+				"Еда: [yellow]%d[-]   Дерево: [yellow]%d[-]   Дома: %d   Мест: %d   Погода: [cyan]%s[-]\n"+
+				"Еда за 60 с: добыто [green]%d[-]   съедено [yellow]%d[-]   баланс: %+d\n"+
+				"Запас без новой добычи: %s",
 			total, busy, total-busy,
-			snapshot.Food, snapshot.Wood, house, snapshot.Weather,
+			snapshot.Food, snapshot.Wood,
+			snapshot.Houses, snapshot.Capacity, snapshot.Weather,
+			produced, consumed, produced-consumed,
+			reserveText,
 		))
 		events.SetText(strings.Join(snapshot.Events, "\n")).ScrollToEnd()
 		if index < 0 || index >= len(snapshot.Colonists) {
@@ -91,21 +116,30 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 		}
 
 		details.SetText(fmt.Sprintf(
-			"[yellow]%s[-]\n\n"+
+			"%s\nВозраст: %d\n\n"+
 				"Действие: %s\n"+
 				"Прогресс:  %s\n\n"+
 				"Голод:     [yellow]%s[-] %d/100\n"+
 				"Усталость: [cyan]%s[-] %d/100\n"+
-				"Любимое занятие: %s",
-			tview.Escape(col.Name), status,
+				"Любимое занятие: %s\n\n"+
+				"Рубка дерева: %s\n"+
+				"Сбор еды: %s\n\n"+
+				"Всего добыто:\n"+
+				"Еда: [green]%d[-]\n"+
+				"Дерево: [yellow]%d[-]",
+			colonistLabel(col), col.Age, status,
 			progressText,
 			bar(col.Hunger), col.Hunger,
 			bar(col.Fatigue), col.Fatigue,
 			col.PreferredWork,
+			skillText(col.Woodcutting),
+			skillText(col.Gathering),
+			col.FoodGathered,
+			col.WoodGathered,
 		))
 	}
 	for _, col := range snapshot.Colonists {
-		list.AddItem(col.Name, "", 0, nil)
+		list.AddItem(colonistLabel(col), "", 0, nil)
 	}
 
 	onSelect := func(
@@ -138,14 +172,19 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 			sendJob(resources.Wood)
 		})
 
+	constructionButton.SetSelectedFunc(func() {
+		c.ToggleConstruction()
+		show(list.GetCurrentItem())
+	})
 	foodButton.SetDisabled(jobs == nil)
 	woodButton.SetDisabled(jobs == nil)
 
 	buttons := tview.NewGrid().
 		SetColumns(0, 24, 0).
-		SetRows(0, 1, 1, 1, 0).
+		SetRows(0, 1, 1, 1, 1, 1, 0).
 		AddItem(woodButton, 1, 1, 1, 1, 0, 0, false).
-		AddItem(foodButton, 3, 1, 1, 1, 0, 0, false)
+		AddItem(foodButton, 3, 1, 1, 1, 0, 0, false).
+		AddItem(constructionButton, 5, 1, 1, 1, 0, 0, false)
 
 	buttons.SetBorder(true).SetTitle(" Поручения деревне ")
 	buttons.SetBorderColor(tcell.ColorGreen)
@@ -157,7 +196,7 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 
 	layout := tview.NewFlex().
 		SetDirection(tview.FlexRow).
-		AddItem(village, 4, 0, false).
+		AddItem(village, 6, 0, false).
 		AddItem(content, 0, 3, true).
 		//AddItem(buttons, 0, 1, false).
 		AddItem(notice, 3, 0, false).
@@ -206,4 +245,44 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 		EnableMouse(true).
 		SetFocus(list).
 		Run()
+}
+
+func skillText(skill Colonist.Skill) string {
+	level := skill.Level()
+
+	if level == Colonist.MaxSkillLevel {
+		return fmt.Sprintf("уровень %d (максимум)", level)
+	}
+
+	return fmt.Sprintf(
+		"уровень %d, опыт %d/%d",
+		level,
+		skill.XP%Colonist.XPerLevel,
+		Colonist.XPerLevel)
+}
+
+func levelColor(level int) string {
+	switch level {
+	case 2:
+		return "lime"
+	case 3:
+		return "cyan"
+	case 4:
+		return "yellow"
+	case 5:
+		return "fuchsia"
+	default:
+		return "white"
+	}
+}
+
+func colonistLabel(col Colonist.Colonist) string {
+	level := col.Level()
+
+	return fmt.Sprintf(
+		"[%s]%s (ур. %d)[-]",
+		levelColor(level),
+		tview.Escape(col.Name),
+		level,
+	)
 }

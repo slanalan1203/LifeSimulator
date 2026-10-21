@@ -1,34 +1,59 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"lifeSimulator/internal/Colonist"
+	"lifeSimulator/internal/api"
 	"lifeSimulator/internal/colony"
 	"lifeSimulator/internal/namegen"
 	"lifeSimulator/internal/resources"
 	"lifeSimulator/internal/ui"
 	"math/rand/v2"
+	"os"
 	"sync"
 	"time"
 )
 
+const savePath = "village.json"
+
 func main() {
-	colonist1 := Colonist.NewColonist(0, "Alan")
-	colonist2 := Colonist.NewColonist(1, "Timur")
-	colonist2.PreferredWork = resources.Food
-	colonist3 := Colonist.NewColonist(2, "Sacha")
-	cols := []Colonist.Colonist{colonist1, colonist2, colonist3}
-	c := colony.NewColony(cols)
+	c, err := colony.Load(savePath)
+
+	if errors.Is(err, os.ErrNotExist) {
+		colonist1 := Colonist.NewColonist(0, "Alan")
+		colonist2 := Colonist.NewColonist(1, "Timur")
+		colonist2.PreferredWork = resources.Food
+		colonist3 := Colonist.NewColonist(2, "Sasha")
+		cols := []Colonist.Colonist{colonist1, colonist2, colonist3}
+		c = colony.NewColony(cols)
+	} else if err != nil {
+		panic(err)
+	}
 	jobs := make(chan colony.Job, 10)
-	stop := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := ctx.Done()
+	server, serverDone := api.Start(api.NewHandler(c, jobs), "127.0.0.1:8080")
+
 	var wg sync.WaitGroup
-	for i := range cols {
+	initialSnaphot := c.Snapshot()
+	for i := range initialSnaphot.Colonists {
 		wg.Go(func() {
-			c.Live(i, jobs, stop)
+			c.Live(ctx, i, jobs)
 		})
 	}
 
 	wg.Go(func() {
 		c.WeatherLoop(stop)
+	})
+
+	wg.Go(func() {
+		c.NeedsLoop(stop)
+	})
+
+	wg.Go(func() {
+		c.AgingLoop(stop)
 	})
 
 	wg.Go(func() {
@@ -42,18 +67,17 @@ func main() {
 			case <-ticker.C:
 				snapshot := c.Snapshot()
 
-				if len(snapshot.Colonists) >= 5 {
-					return
-				}
-
-				if !snapshot.HasHouse || snapshot.Food < 10 {
+				if len(snapshot.Colonists) >= snapshot.Capacity || snapshot.Food < 10 {
 					continue
 				}
 				if rand.IntN(2) != 0 {
 					continue
 				}
 
-				name, err := namegen.Random()
+				name, err := namegen.Random(ctx)
+				if ctx.Err() != nil {
+					return
+				}
 				if err != nil {
 					continue
 				}
@@ -63,18 +87,29 @@ func main() {
 				}
 
 				wg.Go(func() {
-					c.Live(index, jobs, stop)
+					c.Live(ctx, index, jobs)
 				})
 			}
 		}
 	})
 
-	err := ui.Run(c, jobs)
-	close(stop)
-	wg.Wait()
-	close(jobs)
+	uiErr := ui.Run(c, jobs)
 
-	if err != nil {
+	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	shutdownErr := server.Shutdown(shutdownCtx)
+	shutdownCancel()
+
+	if shutdownErr != nil {
+		shutdownErr = errors.Join(shutdownErr, server.Close())
+	}
+	serveErr := <-serverDone
+
+	wg.Wait()
+
+	saveErr := c.Save(savePath)
+	if err := errors.Join(uiErr, shutdownErr, serveErr, saveErr); err != nil {
 		panic(err)
 	}
 }

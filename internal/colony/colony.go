@@ -1,6 +1,7 @@
 package colony
 
 import (
+	"context"
 	"fmt"
 	"lifeSimulator/internal/Colonist"
 	"lifeSimulator/internal/resources"
@@ -12,7 +13,7 @@ import (
 
 const (
 	residentPerHouse = 5
-	housWoodCost     = 5
+	houseWoodCost    = 10
 )
 
 type Colony struct {
@@ -20,24 +21,46 @@ type Colony struct {
 	colonists []Colonist.Colonist
 	storage   map[resources.Resource]int
 
-	houses   int
-	hasHouse bool
+	houses int
+	//hasHouse bool
 
 	eventsMu sync.Mutex
 	events   []string
 
 	weather Weather
+
+	restockFood bool
+	restockWood bool
+
+	buildingHouse bool
+
+	foodProduced int
+	foodConsumed int
+
+	foodHistory []foodChange
+
+	allowConstruction bool
 }
 
 type Snapshot struct {
 	Colonists []Colonist.Colonist
 	Food      int
 	Wood      int
-	HasHouse  bool
+	Houses    int
+	Capacity  int
 
 	Events []string
 
 	Weather Weather
+
+	FoodProduced int
+	FoodConsumed int
+
+	FoodProducedLastMinute int
+	FoodConsumedLastMinute int
+	FoodReserveMinutes     float64
+
+	ConstructionAllowed bool
 }
 
 type Job struct {
@@ -51,29 +74,62 @@ func NewColony(cols []Colonist.Colonist) *Colony {
 		colonists: colonists,
 
 		weather: WeatherClear,
+
+		allowConstruction: true,
 	}
 }
 
-func (c *Colony) DoJob(workerIndex int, resource resources.Resource) {
+func (c *Colony) DoJob(ctx context.Context, workerIndex int, resource resources.Resource) {
+	if err := ctx.Err(); err != nil {
+		return
+	}
 	c.mu.Lock()
 
 	col := &c.colonists[workerIndex]
-
+	if col.Dead || col.Age < 18 {
+		c.mu.Unlock()
+		return
+	}
 	col.Busy = true
 	col.EmployType = resource
 	name := col.Name
 	needsRest := col.Fatigue >= 75
 	restDuration := 3 * time.Second
-	if c.hasHouse {
+	if c.houses > 0 {
 		restDuration = 2 * time.Second
 	}
 	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		col := &c.colonists[workerIndex]
+		if col.Dead {
+			col.Action = "умер"
+		} else {
+			col.Action = "свободен"
+		}
+		col.Busy = false
+		col.EmployType = resources.NotSet
+
+		col.ActionStartedAt = time.Time{}
+		col.ActionDuration = 0
+	}()
+
 	if needsRest {
 		c.logf("%s устал и пошел отдыхать\n", name)
 		c.startAction(workerIndex, "отдыхает", restDuration)
-		time.Sleep(restDuration)
+		if err := waitForAction(ctx, restDuration); err != nil {
+			c.logf("%s прервал работу", name)
+			return
+		}
 		c.mu.Lock()
 		col = &c.colonists[workerIndex]
+		if col.Dead {
+			c.mu.Unlock()
+			return
+		}
 		col.Fatigue = 0
 		c.mu.Unlock()
 		c.logf("%s отдохнул \n", name)
@@ -82,15 +138,30 @@ func (c *Colony) DoJob(workerIndex int, resource resources.Resource) {
 
 	c.mu.Lock()
 	col = &c.colonists[workerIndex]
-
+	if col.Dead {
+		c.mu.Unlock()
+		return
+	}
 	isHungry := col.Hunger >= 60
 	isRaining := c.weather == WeatherRain
+	workLevel := col.Gathering.Level()
+	if resource == resources.Wood {
+		workLevel = col.Woodcutting.Level()
+	}
 	c.mu.Unlock()
 
 	workDuration := 2 * time.Second
 
+	if resource == resources.Wood {
+		workDuration = 8 * time.Second
+	}
+
+	if resource == resources.Food {
+		workDuration = 20 * time.Second
+	}
+
 	if isHungry {
-		workDuration = 4 * time.Second
+		workDuration *= 2
 		c.logf("Очень голоден, но все равно работаю %s\n", name)
 	}
 
@@ -98,6 +169,9 @@ func (c *Colony) DoJob(workerIndex int, resource resources.Resource) {
 		workDuration *= 2
 		c.logf("%s: дождь замедляет рубку дерева", name)
 	}
+
+	durationPercent := 100 - (workLevel-1)*10
+	workDuration = workDuration * time.Duration(durationPercent) / 100
 
 	action := "собирает еду"
 
@@ -107,7 +181,11 @@ func (c *Colony) DoJob(workerIndex int, resource resources.Resource) {
 	c.startAction(workerIndex, action, workDuration)
 	c.logf("Начал работу: %s\n", name)
 
-	time.Sleep(workDuration)
+	err := waitForAction(ctx, workDuration)
+	if err != nil {
+		c.logf("%s прервал работу", name)
+		return
+	}
 
 	amount := 1
 	if rand.IntN(100) < 20 {
@@ -117,64 +195,109 @@ func (c *Colony) DoJob(workerIndex int, resource resources.Resource) {
 		amount++
 	}
 	c.mu.Lock()
-	col = &c.colonists[workerIndex]
+	if ctx.Err() != nil {
+		c.mu.Unlock()
+		return
+	}
 
+	col = &c.colonists[workerIndex]
+	if col.Dead {
+		c.mu.Unlock()
+		return
+	}
 	fatigueGain := 25
 	if resource == col.PreferredWork {
 		fatigueGain = 15
 	}
-	col.Hunger = min(100, col.Hunger+20)
 	col.Fatigue = min(100, col.Fatigue+fatigueGain)
 	c.storage[resource] += amount
-	col.Busy = false
+	switch resource {
+	case resources.Food:
+		col.Gathering.AddXp()
+		col.FoodGathered += amount
+		c.recordFoodChangedLocked(amount, 0)
 
-	col.Action = "свободен"
-	col.ActionStartedAt = time.Time{}
-	col.ActionDuration = 0
-
+	case resources.Wood:
+		col.Woodcutting.AddXp()
+		col.WoodGathered += amount
+	}
 	c.mu.Unlock()
-
-	c.TryBuildHouse()
 	c.logf("%s закончил работу: %s +%d\n", name, resource, amount)
 }
 
-func (c *Colony) Work(workerIndex int, jobs <-chan Job) {
-	for job := range jobs {
-		c.DoJob(workerIndex, job.Resource)
+func (c *Colony) Work(ctx context.Context, workerIndex int, jobs <-chan Job) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+			c.DoJob(ctx, workerIndex, job.Resource)
+		}
 	}
 }
 
-func (c *Colony) Live(workerIndex int, jobs <-chan Job, stop <-chan struct{}) {
+func (c *Colony) Live(ctx context.Context, workerIndex int, jobs <-chan Job) {
+	stop := ctx.Done()
 	for {
 		select {
 		case <-stop:
 			return
 		default:
 		}
+		c.mu.Lock()
+		dead := c.colonists[workerIndex].Dead
+		isChild := c.colonists[workerIndex].Age < 18
+		c.mu.Unlock()
+		if dead {
+			return
+		}
+		if isChild {
+			c.startAction(workerIndex, "играет", 2 * time.Second)
+
+			if err := waitForAction(ctx, 2*time.Second); err != nil {
+				return
+			}
+		}
 		select {
 		case job, ok := <-jobs:
 			if ok {
-				c.DoJob(workerIndex, job.Resource)
+				c.DoJob(ctx, workerIndex, job.Resource)
 				continue
 			}
 			jobs = nil
 		default:
 		}
-		c.mu.Lock()
-		food := c.storage[resources.Food]
-		targetFood := len(c.colonists) * 2
-		name := c.colonists[workerIndex].Name
-		preferredWork := c.colonists[workerIndex].PreferredWork
-
-		c.mu.Unlock()
-
-		resource := preferredWork
-		if food < targetFood {
-			resource = resources.Food
+		if c.TryBuildHouse(workerIndex, stop) {
+			continue
 		}
+		resource := c.chooseWork(workerIndex)
 
-		c.logf("%s решил добывать %s\n", name, resource)
-		c.DoJob(workerIndex, resource)
+		if resource == resources.NotSet {
+			c.startAction(workerIndex, "гуляет", 2*time.Second)
+
+			select {
+			case <-stop:
+				return
+			case job, ok := <-jobs:
+				if ok {
+					c.DoJob(ctx, workerIndex, job.Resource)
+				} else {
+					jobs = nil
+				}
+			case <-time.After(2 * time.Second):
+				c.mu.Lock()
+				col := &c.colonists[workerIndex]
+				if !col.Dead {
+					col.Fatigue = max(0, col.Fatigue-5)
+				}
+				c.mu.Unlock()
+			}
+			continue
+		}
+		c.DoJob(ctx, workerIndex, resource)
 	}
 }
 
@@ -213,10 +336,10 @@ func (c *Colony) Status() {
 	for k, v := range c.storage {
 		fmt.Println("Ресурс:", k, v)
 	}
-	fmt.Println("Дом построен:", c.hasHouse)
+	fmt.Println("Домов:", c.houses)
 }
 
-func (c *Colony) Gather(resource resources.Resource) bool {
+func (c *Colony) Gather(ctx context.Context, resource resources.Resource) bool {
 	if resource != resources.Wood && resource != resources.Food {
 		return false
 	}
@@ -230,10 +353,13 @@ func (c *Colony) Gather(resource resources.Resource) bool {
 		name := c.colonists[i].Name
 		c.mu.Unlock()
 		c.logf("Начал работу %s\n", name)
-		time.Sleep(2 * time.Second)
+		c.startAction(i, "работа", 2*time.Second)
 		c.logf("Закончил работу %s\n", name)
 		c.mu.Lock()
 		c.storage[resource]++
+		if resource == resources.Food {
+			c.recordFoodChangedLocked(1, 0)
+		}
 		c.colonists[i].Busy = false
 		c.mu.Unlock()
 		return true
@@ -248,7 +374,7 @@ func (c *Colony) Eat(workerIndex int) {
 
 	colonist := &c.colonists[workerIndex]
 
-	if colonist.Hunger < 60 {
+	if colonist.Dead || colonist.Hunger < 60 {
 		return
 	}
 
@@ -257,27 +383,121 @@ func (c *Colony) Eat(workerIndex int) {
 		return
 	}
 	c.storage[resources.Food]--
+	c.recordFoodChangedLocked(0, 1)
 	colonist.Hunger -= 60
 
 	c.logf("%s поел, голод %d\n", colonist.Name, colonist.Hunger)
 }
 
-func (c *Colony) TryBuildHouse() {
+func (c *Colony) TryBuildHouse(workerIndex int, stop <-chan struct{}) bool {
+	duration := 30 * time.Second
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	freePlaces := c.houses*residentPerHouse - len(c.colonists)
+	col := &c.colonists[workerIndex]
 
-	if c.hasHouse || c.storage[resources.Wood] < 5 {
-		return
+	if col.Dead ||
+		col.Age < 18 ||
+		!c.allowConstruction ||
+		c.buildingHouse ||
+		freePlaces > 1 ||
+		c.storage[resources.Food] < len(c.colonists) ||
+		c.storage[resources.Wood] < houseWoodCost ||
+		col.Busy ||
+		col.Fatigue >= 75 ||
+		col.Hunger >= 60 {
+		c.mu.Unlock()
+		return false
 	}
-	c.storage[resources.Wood] -= 5
-	c.hasHouse = true
-	c.logf("Жители построили общий дом! Потрачено 5 дерева.\n")
+	c.buildingHouse = true
+	c.storage[resources.Wood] -= houseWoodCost
+
+	col.Busy = true
+	col.EmployType = resources.NotSet
+	col.Action = "строит дом"
+	col.ActionStartedAt = time.Now()
+	col.ActionDuration = duration
+	name := col.Name
+	c.mu.Unlock()
+
+	c.logf("%s начал строить дом", name)
+
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	finished := false
+
+	select {
+	case <-stop:
+	case <-timer.C:
+		finished = true
+	}
+	c.mu.Lock()
+
+	col = &c.colonists[workerIndex]
+	finished = finished && !col.Dead
+	if finished {
+		c.houses++
+		col.Fatigue = min(100, col.Fatigue+25)
+	} else {
+		c.storage[resources.Wood] += houseWoodCost
+	}
+
+	houseNumber := c.houses
+	c.buildingHouse = false
+
+	col.Busy = false
+	if col.Dead {
+		col.Action = "умер"
+	} else {
+		col.Action = "свободен"
+	}
+	col.ActionStartedAt = time.Time{}
+	col.ActionDuration = 0
+	c.mu.Unlock()
+
+	if finished {
+		c.logf("%s построил дом №%d", name, houseNumber)
+	} else {
+		c.logf("%s прервал стройку, дерево возвращено", name)
+	}
+
+	return true
+}
+
+func (c *Colony) ToggleConstruction() {
+	c.mu.Lock()
+
+	c.allowConstruction = !c.allowConstruction
+	allowed := c.allowConstruction
+
+	c.mu.Unlock()
+
+	if allowed {
+		c.logf("Новое строительство разрешено")
+	} else {
+		c.logf("Новое строительство приостановлено")
+	}
 }
 
 func (c *Colony) Snapshot() Snapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	producedLastMinute := 0
+	consumedLastMinute := 0
+	cutoff := time.Now().Add(-time.Minute)
+	for _, change := range c.foodHistory {
+		if change.at.After(cutoff) {
+			producedLastMinute += change.produced
+			consumedLastMinute += change.consumed
+		}
+	}
+
+	foodPerMinute := float64(len(c.colonists)) * 2
+	reserveMinutes := 0.0
+	if foodPerMinute > 0 {
+		reserveMinutes = float64(c.storage[resources.Food]) / foodPerMinute
+	}
 	c.eventsMu.Lock()
 	defer c.eventsMu.Unlock()
 
@@ -285,11 +505,21 @@ func (c *Colony) Snapshot() Snapshot {
 		Colonists: append([]Colonist.Colonist{}, c.colonists...),
 		Food:      c.storage[resources.Food],
 		Wood:      c.storage[resources.Wood],
-		HasHouse:  c.hasHouse,
+		Houses:    c.houses,
+		Capacity:  c.houses * residentPerHouse,
 
 		Events: append([]string{}, c.events...),
 
 		Weather: c.weather,
+
+		FoodConsumed: c.foodConsumed,
+		FoodProduced: c.foodProduced,
+
+		FoodConsumedLastMinute: consumedLastMinute,
+		FoodReserveMinutes:     reserveMinutes,
+		FoodProducedLastMinute: producedLastMinute,
+
+		ConstructionAllowed: c.allowConstruction,
 	}
 }
 
@@ -310,6 +540,9 @@ func (c *Colony) startAction(workerIndex int, action string, duration time.Durat
 	defer c.mu.Unlock()
 
 	col := &c.colonists[workerIndex]
+	if col.Dead {
+		return
+	}
 	col.Action = action
 	col.ActionDuration = duration
 	col.ActionStartedAt = time.Now()
@@ -319,7 +552,8 @@ func (c *Colony) TryAddColonist(name string) (int, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if !c.hasHouse || len(c.colonists) >= 5 || c.storage[resources.Food] < 10 {
+	capacity := c.houses * residentPerHouse
+	if len(c.colonists) >= capacity || c.storage[resources.Food] < 10 {
 		return -1, false
 	}
 
