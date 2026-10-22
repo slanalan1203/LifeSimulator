@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"errors"
-	"lifeSimulator/internal/Colonist"
 	"lifeSimulator/internal/api"
+	"lifeSimulator/internal/balance"
 	"lifeSimulator/internal/colony"
+	"lifeSimulator/internal/database"
 	"lifeSimulator/internal/namegen"
-	"lifeSimulator/internal/resources"
 	"lifeSimulator/internal/ui"
 	"math/rand/v2"
 	"os"
@@ -16,27 +16,47 @@ import (
 )
 
 const savePath = "village.json"
+const configPath = "internal/balance/config.json"
 
 func main() {
-	c, err := colony.Load(savePath)
 
-	if errors.Is(err, os.ErrNotExist) {
-		colonist1 := Colonist.NewColonist(0, "Alan")
-		colonist2 := Colonist.NewColonist(1, "Timur")
-		colonist2.PreferredWork = resources.Food
-		colonist3 := Colonist.NewColonist(2, "Sasha")
-		cols := []Colonist.Colonist{colonist1, colonist2, colonist3}
-		c = colony.NewColony(cols)
-	} else if err != nil {
+	dbCtx, cancelDB := context.WithTimeout(context.Background(), 5*time.Second)
+
+	pool, err := database.Connect(dbCtx, os.Getenv("DATABASE_URL"))
+	cancelDB()
+
+	if err != nil {
+		panic(err)
+	}
+	defer pool.Close()
+
+	cfg, err := balance.Load(configPath)
+	if err != nil {
+		panic(err)
+	}
+
+	loadCtx, cancelLoad := context.WithTimeout(context.Background(), 15*time.Second)
+	c, err := restoreVillage(loadCtx, pool, cfg)
+	cancelLoad()
+	if err != nil {
 		panic(err)
 	}
 	jobs := make(chan colony.Job, 10)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stop := ctx.Done()
-	server, serverDone := api.Start(api.NewHandler(c, jobs), "127.0.0.1:8080")
+	address := os.Getenv("HTTP_ADDR")
+	if address == "" {
+		address = "127.0.0.1:8080"
+	}
+	server, serverDone := api.Start(api.NewHandler(c, jobs), address)
 
 	var wg sync.WaitGroup
+	names := namegen.NewPool()
+	wg.Go(func() {
+		names.Run(ctx)
+	})
+
 	initialSnaphot := c.Snapshot()
 	for i, col := range initialSnaphot.Colonists {
 		if col.Dead {
@@ -57,20 +77,21 @@ func main() {
 
 	wg.Go(func() {
 		c.AgingLoop(stop, func() {
-			if ctx.Err() != nil || !c.CanHaveChild() || rand.Float64() >= 0.25 {
-				return
+			for range c.BirthAttempts() {
+				if ctx.Err() != nil || !c.CanHaveChild() {
+					return
+				}
+				if rand.Float64() >= c.Config().Population.BirthChancePerPairPerYear {
+					continue
+				}
+				index, ok := c.TryBirth(names.Next())
+				if !ok {
+					return
+				}
+				wg.Go(func() {
+					c.Live(ctx, index, jobs)
+				})
 			}
-			name, err := namegen.Random(ctx)
-			if err != nil || ctx.Err() != nil {
-				return
-			}
-			index, ok := c.TryBirth(name)
-			if !ok {
-				return
-			}
-			wg.Go(func() {
-				c.Live(ctx, index, jobs)
-			})
 		})
 	})
 
@@ -92,14 +113,10 @@ func main() {
 					continue
 				}
 
-				name, err := namegen.Random(ctx)
 				if ctx.Err() != nil {
 					return
 				}
-				if err != nil {
-					continue
-				}
-				index, ok := c.TryAddColonist(name)
+				index, ok := c.TryAddColonist(names.Next())
 				if !ok {
 					continue
 				}
@@ -111,7 +128,11 @@ func main() {
 		}
 	})
 
-	uiErr := ui.Run(c, jobs)
+	wg.Go(func() {
+		autosave(ctx, pool, c)
+	})
+
+	uiErr := ui.Run(c, jobs, configPath)
 
 	cancel()
 
@@ -126,7 +147,9 @@ func main() {
 
 	wg.Wait()
 
-	saveErr := c.Save(savePath)
+	saveCtx, cancelSave := context.WithTimeout(context.Background(), saveTimeout)
+	saveErr := saveProgress(saveCtx, pool, c)
+	cancelSave()
 	if err := errors.Join(uiErr, shutdownErr, serveErr, saveErr); err != nil {
 		panic(err)
 	}

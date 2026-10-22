@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"lifeSimulator/internal/Colonist"
+	"lifeSimulator/internal/balance"
 	"lifeSimulator/internal/colony"
 	"lifeSimulator/internal/resources"
 	"strings"
@@ -13,9 +14,12 @@ import (
 	"github.com/rivo/tview"
 )
 
-func Run(c *colony.Colony, jobs chan<- colony.Job) error {
+func Run(c *colony.Colony, jobs chan<- colony.Job, configPath string) error {
 	snapshot := c.Snapshot()
 	app := tview.NewApplication()
+	pages := tview.NewPages()
+	var settingsForm *tview.Form
+	var previousFocus tview.Primitive
 	quit := make(chan struct{})
 	var quitOnce sync.Once
 	requestQuit := func() {
@@ -55,7 +59,7 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 			constructionButton.SetLabel("Разрешить стройку")
 		}
 		for i, col := range snapshot.Colonists {
-			label := colonistLabel(col)
+			label := colonistLabel(col, snapshot.AdultAge)
 
 			if i >= list.GetItemCount() {
 				list.AddItem(label, "", 0, nil)
@@ -127,7 +131,7 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 				"Всего добыто:\n"+
 				"Еда: [green]%d[-]\n"+
 				"Дерево: [yellow]%d[-]",
-			colonistLabel(col), col.Age, status,
+			colonistLabel(col, snapshot.AdultAge), col.Age, status,
 			progressText,
 			bar(col.Hunger), col.Hunger,
 			bar(col.Fatigue), col.Fatigue,
@@ -139,7 +143,7 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 		))
 	}
 	for _, col := range snapshot.Colonists {
-		list.AddItem(colonistLabel(col), "", 0, nil)
+		list.AddItem(colonistLabel(col, snapshot.AdultAge), "", 0, nil)
 	}
 
 	onSelect := func(
@@ -151,7 +155,37 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 	list.SetChangedFunc(onSelect)
 	list.SetSelectedFunc(onSelect)
 
-	notice := tview.NewTextView().SetText("Поручения выполняют взрослые жители деревни.")
+	notice := tview.NewTextView().SetText("Поручения выполняют взрослые жители деревни. F2 — настройки.")
+	closeSettings := func() {
+		if settingsForm == nil {
+			return
+		}
+		pages.RemovePage("settings")
+		settingsForm = nil
+		app.SetFocus(previousFocus)
+	}
+	openSettings := func() {
+		if settingsForm != nil {
+			return
+		}
+		previousFocus = app.GetFocus()
+		settingsForm = newSettingsForm(c.Config(), func(cfg balance.Config) error {
+			if err := balance.Save(configPath, cfg); err != nil {
+				return fmt.Errorf("сохранить настройки: %w", err)
+			}
+			if err := c.UpdateConfig(cfg); err != nil {
+				return err
+			}
+			closeSettings()
+			show(list.GetCurrentItem())
+			notice.SetText("Настройки сохранены и применены. F2 — настройки.")
+			return nil
+		}, closeSettings)
+		pages.AddPage("settings", settingsForm, false, true)
+		settingsForm.SetFocus(0)
+		app.SetFocus(settingsForm)
+	}
+	settingsButton := tview.NewButton("Настройки (F2)").SetSelectedFunc(openSettings)
 
 	sendJob := func(resource resources.Resource) {
 		select {
@@ -181,10 +215,11 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 
 	buttons := tview.NewGrid().
 		SetColumns(0, 24, 0).
-		SetRows(0, 1, 1, 1, 1, 1, 0).
+		SetRows(0, 1, 1, 1, 1, 1, 1, 1, 0).
 		AddItem(woodButton, 1, 1, 1, 1, 0, 0, false).
 		AddItem(foodButton, 3, 1, 1, 1, 0, 0, false).
-		AddItem(constructionButton, 5, 1, 1, 1, 0, 0, false)
+		AddItem(constructionButton, 5, 1, 1, 1, 0, 0, false).
+		AddItem(settingsButton, 7, 1, 1, 1, 0, 0, false)
 
 	buttons.SetBorder(true).SetTitle(" Поручения деревне ")
 	buttons.SetBorderColor(tcell.ColorGreen)
@@ -201,11 +236,49 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 		//AddItem(buttons, 0, 1, false).
 		AddItem(notice, 3, 0, false).
 		AddItem(events, 0, 1, false)
+	pages.AddPage("village", layout, true, true)
+
+	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		if settingsForm != nil {
+			width, height := screen.Size()
+			formWidth := min(82, width)
+			formHeight := min(22, height)
+			settingsForm.SetRect((width-formWidth)/2, (height-formHeight)/2, formWidth, formHeight)
+		}
+		return false
+	})
+	app.SetMouseCapture(func(event *tcell.EventMouse, action tview.MouseAction) (*tcell.EventMouse, tview.MouseAction) {
+		if settingsForm != nil {
+			x, y := event.Position()
+			left, top, width, height := settingsForm.GetRect()
+			if x < left || x >= left+width || y < top || y >= top+height {
+				return nil, action
+			}
+		}
+		return event, action
+	})
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEscape ||
-			event.Key() == tcell.KeyCtrlC {
+		if event.Key() == tcell.KeyCtrlC {
 			requestQuit()
+			return nil
+		}
+		if settingsForm != nil {
+			if event.Key() == tcell.KeyEscape {
+				closeSettings()
+				return nil
+			}
+			if event.Key() == tcell.KeyF2 {
+				return nil
+			}
+			return event
+		}
+		if event.Key() == tcell.KeyEscape {
+			requestQuit()
+			return nil
+		}
+		if event.Key() == tcell.KeyF2 {
+			openSettings()
 			return nil
 		}
 
@@ -241,7 +314,7 @@ func Run(c *colony.Colony, jobs chan<- colony.Job) error {
 		})
 	})
 
-	return app.SetRoot(layout, true).
+	return app.SetRoot(pages, true).
 		EnableMouse(true).
 		SetFocus(list).
 		Run()
@@ -276,11 +349,11 @@ func levelColor(level int) string {
 	}
 }
 
-func colonistLabel(col Colonist.Colonist) string {
+func colonistLabel(col Colonist.Colonist, adultAge int) string {
 	if col.Dead {
 		return fmt.Sprintf("[gray]%s (умер)[-]", tview.Escape(col.Name))
 	}
-	if col.Age < 18 {
+	if col.Age < adultAge {
 		return fmt.Sprintf("[cyan]%s (%d, ребёнок)[-]", tview.Escape(col.Name), col.Age)
 	}
 	level := col.Level()

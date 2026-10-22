@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"lifeSimulator/internal/Colonist"
+	"lifeSimulator/internal/balance"
 	"lifeSimulator/internal/resources"
 	"math/rand/v2"
 	"strings"
@@ -36,10 +37,18 @@ type Colony struct {
 
 	foodProduced int
 	foodConsumed int
+	births       uint64
+	deaths       uint64
+	immigrants   uint64
 
 	foodHistory []foodChange
 
 	allowConstruction bool
+
+	cfg balance.Config
+
+	needsChanged chan struct{}
+	yearChanged  chan struct{}
 }
 
 type Snapshot struct {
@@ -63,13 +72,14 @@ type Snapshot struct {
 	ConstructionAllowed bool
 
 	Population int
+	AdultAge   int
 }
 
 type Job struct {
 	Resource resources.Resource
 }
 
-func NewColony(cols []Colonist.Colonist) *Colony {
+func NewColony(cols []Colonist.Colonist, cfg balance.Config) *Colony {
 	colonists := append([]Colonist.Colonist{}, cols...)
 	return &Colony{
 		storage:   make(map[resources.Resource]int),
@@ -78,6 +88,9 @@ func NewColony(cols []Colonist.Colonist) *Colony {
 		weather: WeatherClear,
 
 		allowConstruction: true,
+		cfg:               cfg,
+		needsChanged:      make(chan struct{}, 1),
+		yearChanged:       make(chan struct{}, 1),
 	}
 }
 
@@ -88,7 +101,7 @@ func (c *Colony) DoJob(ctx context.Context, workerIndex int, resource resources.
 	c.mu.Lock()
 
 	col := &c.colonists[workerIndex]
-	if col.Dead || col.Age < 18 {
+	if col.Dead || col.Age < c.cfg.Population.AdultAge {
 		c.mu.Unlock()
 		return
 	}
@@ -144,8 +157,9 @@ func (c *Colony) DoJob(ctx context.Context, workerIndex int, resource resources.
 		c.mu.Unlock()
 		return
 	}
-	isHungry := col.Hunger >= 60
+	isHungry := col.Hunger >= c.cfg.Needs.HungerPerMeal
 	isRaining := c.weather == WeatherRain
+	work := c.cfg.Work
 	workLevel := col.Gathering.Level()
 	if resource == resources.Wood {
 		workLevel = col.Woodcutting.Level()
@@ -154,12 +168,11 @@ func (c *Colony) DoJob(ctx context.Context, workerIndex int, resource resources.
 
 	workDuration := 2 * time.Second
 
-	if resource == resources.Wood {
-		workDuration = 8 * time.Second
-	}
-
-	if resource == resources.Food {
-		workDuration = 20 * time.Second
+	switch resource {
+	case resources.Wood:
+		workDuration = time.Duration(work.WoodSeconds) * time.Second
+	case resources.Food:
+		workDuration = time.Duration(work.FoodSeconds) * time.Second
 	}
 
 	if isHungry {
@@ -251,7 +264,7 @@ func (c *Colony) Live(ctx context.Context, workerIndex int, jobs <-chan Job) {
 		}
 		c.mu.Lock()
 		dead := c.colonists[workerIndex].Dead
-		isChild := c.colonists[workerIndex].Age < 18
+		isChild := c.colonists[workerIndex].Age < c.cfg.Population.AdultAge
 		c.mu.Unlock()
 		if dead {
 			return
@@ -377,7 +390,7 @@ func (c *Colony) Eat(workerIndex int) {
 
 	colonist := &c.colonists[workerIndex]
 
-	if colonist.Dead || colonist.Hunger < 60 {
+	if colonist.Dead || colonist.Hunger < c.cfg.Needs.HungerPerMeal {
 		return
 	}
 
@@ -387,7 +400,7 @@ func (c *Colony) Eat(workerIndex int) {
 	}
 	c.storage[resources.Food]--
 	c.recordFoodChangedLocked(0, 1)
-	colonist.Hunger -= 60
+	colonist.Hunger -= c.cfg.Needs.HungerPerMeal
 
 	c.logf("%s поел, голод %d\n", colonist.Name, colonist.Hunger)
 }
@@ -400,15 +413,15 @@ func (c *Colony) TryBuildHouse(workerIndex int, stop <-chan struct{}) bool {
 	col := &c.colonists[workerIndex]
 
 	if col.Dead ||
-		col.Age < 18 ||
+		col.Age < c.cfg.Population.AdultAge ||
 		!c.allowConstruction ||
 		c.buildingHouse ||
 		freePlaces > 1 ||
-		c.storage[resources.Food] < people ||
+		c.storage[resources.Food] < c.foodReserveLocked(2*time.Minute) ||
 		c.storage[resources.Wood] < houseWoodCost ||
 		col.Busy ||
 		col.Fatigue >= 75 ||
-		col.Hunger >= 60 {
+		col.Hunger >= c.cfg.Needs.HungerPerMeal {
 		c.mu.Unlock()
 		return false
 	}
@@ -487,6 +500,10 @@ func (c *Colony) Snapshot() Snapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	return c.snapshotLocked()
+}
+
+func (c *Colony) snapshotLocked() Snapshot {
 	producedLastMinute := 0
 	consumedLastMinute := 0
 	cutoff := time.Now().Add(-time.Minute)
@@ -499,7 +516,7 @@ func (c *Colony) Snapshot() Snapshot {
 	}
 
 	population := c.aliveCountLocked()
-	foodPerMinute := float64(population) * 2
+	foodPerMinute := c.foodConsumptionPerMinuteLocked()
 	reserveMinutes := 0.0
 
 	if foodPerMinute > 0 {
@@ -511,6 +528,7 @@ func (c *Colony) Snapshot() Snapshot {
 
 	return Snapshot{
 		Population: population,
+		AdultAge:   c.cfg.Population.AdultAge,
 		Colonists:  append([]Colonist.Colonist{}, c.colonists...),
 		Food:       c.storage[resources.Food],
 		Wood:       c.storage[resources.Wood],
@@ -530,6 +548,10 @@ func (c *Colony) Snapshot() Snapshot {
 
 		ConstructionAllowed: c.allowConstruction,
 	}
+}
+
+func (c *Colony) AddEvent(message string) {
+	c.logf("%s", message)
 }
 
 func (c *Colony) logf(format string, args ...any) {
@@ -567,14 +589,15 @@ func (c *Colony) TryAddColonist(name string) (int, bool) {
 	}
 
 	index := len(c.colonists)
-	newColonist := Colonist.NewColonist(index, name)
+	newColonist := Colonist.NewColonist(index, name, c.cfg.Population.AdultAge)
 
 	if rand.IntN(2) == 0 {
 		newColonist.PreferredWork = resources.Food
 	}
 
 	c.colonists = append(c.colonists, newColonist)
-	c.logf("В деревне новый житель: %s", name)
+	c.immigrants++
+	c.logf("В деревне новый житель: %s", newColonist.Name)
 
 	return index, true
 }

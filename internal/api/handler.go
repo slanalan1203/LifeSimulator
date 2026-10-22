@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"lifeSimulator/internal/colony"
+	"lifeSimulator/internal/monitoring"
 	"lifeSimulator/internal/resources"
 	"net/http"
 	"strconv"
@@ -177,5 +178,6 @@ func NewHandler(c *colony.Colony, jobs chan<- colony.Job) http.Handler {
 			http.Error(w, "Очередь поручений заполнена", http.StatusServiceUnavailable)
 		}
 	})
+	mux.Handle("GET /metrics", monitoring.NewHandler(c))
 	return mux
 }

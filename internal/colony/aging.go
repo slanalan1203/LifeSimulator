@@ -6,15 +6,20 @@ import (
 	"time"
 )
 
-const yearDuration = 30 * time.Second
-
 func (c *Colony) AgingLoop(stop <-chan struct{}, onYear func()) {
-	ticker := time.NewTicker(yearDuration)
+	interval := time.Duration(c.Config().Time.YearSeconds) * time.Second
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-stop:
 			return
+		case <-c.yearChanged:
+			updatedInterval := time.Duration(c.Config().Time.YearSeconds) * time.Second
+			if updatedInterval != interval {
+				interval = updatedInterval
+				ticker.Reset(interval)
+			}
 		case <-ticker.C:
 			c.mu.Lock()
 
@@ -27,6 +32,7 @@ func (c *Colony) AgingLoop(stop <-chan struct{}, onYear func()) {
 				col.Age++
 				if rand.Float64() < chance {
 					col.Dead = true
+					c.deaths++
 					col.Busy = false
 					col.EmployType = resources.NotSet
 					col.Action = "умер"
@@ -35,7 +41,7 @@ func (c *Colony) AgingLoop(stop <-chan struct{}, onYear func()) {
 					c.logf("%s умер, возраст: %d", col.Name, col.Age)
 					continue
 				}
-				if col.Age == 18 {
+				if col.Age == c.cfg.Population.AdultAge {
 					c.logf("%s стал взрослым и теперь может работать", col.Name)
 				} else {
 					c.logf("День рождения: %s, возраст %d", col.Name, col.Age)

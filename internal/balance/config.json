@@ -1,0 +1,21 @@
+{
+  "time": {
+    "year_seconds": 30
+  },
+  "population": {
+    "adult_age": 18,
+    "fertility_max_age": 45,
+    "birth_chance_per_pair_per_year": 0.12,
+    "birth_food_cost": 3
+  },
+  "needs": {
+    "tick_seconds": 5,
+    "adult_hunger_per_tick": 10,
+    "child_hunger_per_tick": 5,
+    "hunger_per_meal": 60
+  },
+  "work": {
+    "wood_seconds": 8,
+    "food_seconds": 20
+  }
+}

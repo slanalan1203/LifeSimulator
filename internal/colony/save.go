@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"lifeSimulator/internal/Colonist"
-	"lifeSimulator/internal/resources"
+	"lifeSimulator/internal/balance"
 	"os"
-	"time"
+	"path/filepath"
 )
 
 type saveData struct {
@@ -22,7 +22,13 @@ type saveData struct {
 }
 
 func (c *Colony) Save(path string) error {
-	snapshot := c.Snapshot()
+	return SaveSnapshot(path, c.PersistenceSnapshot())
+}
+
+func SaveSnapshot(path string, snapshot Snapshot) error {
+	if err := ValidateSnapshot(snapshot); err != nil {
+		return fmt.Errorf("проверить сохранение: %w", err)
+	}
 
 	data := &saveData{
 		Version:             3,
@@ -41,19 +47,30 @@ func (c *Colony) Save(path string) error {
 		return fmt.Errorf("подготовка сохранения: %w", err)
 	}
 
-	tempPath := path + ".tmp"
+	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return fmt.Errorf("создать временное сохранение: %w", err)
+	}
+	tempPath := temp.Name()
+	defer temp.Close()
 	defer os.Remove(tempPath)
-	if err := os.WriteFile(tempPath, content, 0600); err != nil {
-		return fmt.Errorf("Запись сохранения: %w", err)
+	if _, err := temp.Write(content); err != nil {
+		return fmt.Errorf("записать сохранение: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("синхронизировать сохранение: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("закрыть временное сохранение: %w", err)
 	}
 
 	if err := os.Rename(tempPath, path); err != nil {
-		return fmt.Errorf("Заменить сохранение: %w", err)
+		return fmt.Errorf("заменить сохранение: %w", err)
 	}
 	return nil
 }
 
-func Load(path string) (*Colony, error) {
+func Load(path string, cfg balance.Config) (*Colony, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("прочитать сохранение: %w", err)
@@ -66,51 +83,20 @@ func Load(path string) (*Colony, error) {
 	switch data.Version {
 	case 1:
 		for i := range data.Colonist {
-			data.Colonist[i].Age = 18
+			data.Colonist[i].Age = cfg.Population.AdultAge
 		}
 	case 2, 3:
 	default:
 		return nil, fmt.Errorf("неподдерживаемая версия: %d", data.Version)
 	}
-	if len(data.Colonist) == 0 {
-		return nil, fmt.Errorf("В сохранении нет жителей")
-	}
-
-	if data.Food < 0 || data.Wood < 0 || data.Houses < 0 || data.FoodProduced < 0 || data.FoodConsumed < 0 {
-		return nil, fmt.Errorf("В сохранении есть отрицательные значения")
-	}
-
-	if data.Weather != WeatherRain && data.Weather != WeatherClear {
-		return nil, fmt.Errorf("неизвестная погода: %q", data.Weather)
-	}
-
-	for i := range data.Colonist {
-		col := &data.Colonist[i]
-		if col.Age < 0 {
-			return nil, fmt.Errorf("отрицательный возраст жителя: %d", col.ID)
-		}
-
-		col.Busy = false
-		col.EmployType = resources.NotSet
-		switch {
-		case col.Dead:
-			col.Action = "умер"
-		case col.Age < 18:
-			col.Action = "играет"
-		default:
-			col.Action = "свободен"
-		}
-		col.ActionStartedAt = time.Time{}
-		col.ActionDuration = 0
-	}
-	c := NewColony(data.Colonist)
-
-	c.storage[resources.Food] = data.Food
-	c.storage[resources.Wood] = data.Wood
-	c.houses = data.Houses
-	c.weather = data.Weather
-	c.allowConstruction = data.ConstructionAllowed
-	c.foodProduced = data.FoodProduced
-	c.foodConsumed = data.FoodConsumed
-	return c, nil
+	return FromSnapshot(Snapshot{
+		Colonists:           data.Colonist,
+		Food:                data.Food,
+		Wood:                data.Wood,
+		Houses:              data.Houses,
+		Weather:             data.Weather,
+		ConstructionAllowed: data.ConstructionAllowed,
+		FoodProduced:        data.FoodProduced,
+		FoodConsumed:        data.FoodConsumed,
+	}, cfg)
 }

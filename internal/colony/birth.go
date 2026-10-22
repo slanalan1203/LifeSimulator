@@ -3,10 +3,27 @@ package colony
 import (
 	"lifeSimulator/internal/Colonist"
 	"lifeSimulator/internal/resources"
+	"math"
 	"math/rand/v2"
+	"time"
 )
 
-const birthFoodCost = 3
+func (c *Colony) BirthAttempts() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.reproductiveAdultsLocked() / 2
+}
+
+func (c *Colony) reproductiveAdultsLocked() int {
+	adults := 0
+	for _, col := range c.colonists {
+		if !col.Dead && col.Age >= c.cfg.Population.AdultAge && col.Age <= c.cfg.Population.FertilityMaxAge {
+			adults++
+		}
+	}
+	return adults
+}
 
 func (c *Colony) CanHaveChild() bool {
 	c.mu.Lock()
@@ -20,18 +37,15 @@ func (c *Colony) canHaveChildLocked() bool {
 	if population >= c.houses*residentPerHouse {
 		return false
 	}
-	if c.storage[resources.Food] < (population+1)*4+birthFoodCost {
+	child := Colonist.Colonist{Age: 0}
+	childReserve := int(math.Ceil(c.foodConsumptionPerMinuteFor(child) * 2))
+	food := c.storage[resources.Food]
+	cost := c.cfg.Population.BirthFoodCost
+	if food < cost || food-cost < c.foodReserveLocked(2*time.Minute)+childReserve {
 		return false
 	}
 
-	adults := 0
-	for _, col := range c.colonists {
-		if !col.Dead && col.Age >= 18 && col.Age <= 45 {
-			adults++
-		}
-	}
-
-	return adults >= 2
+	return c.reproductiveAdultsLocked() >= 2
 }
 
 func (c *Colony) TryBirth(name string) (int, bool) {
@@ -43,17 +57,17 @@ func (c *Colony) TryBirth(name string) (int, bool) {
 	}
 
 	index := len(c.colonists)
-	child := Colonist.NewColonist(index, name)
-	child.Age = 0
+	child := Colonist.NewColonist(index, name, 0)
 	child.Action = "играет"
 	if rand.IntN(2) == 0 {
 		child.PreferredWork = resources.Food
 	}
 
-	c.storage[resources.Food] -= birthFoodCost
-	c.recordFoodChangedLocked(0, birthFoodCost)
+	c.storage[resources.Food] -= c.cfg.Population.BirthFoodCost
+	c.recordFoodChangedLocked(0, c.cfg.Population.BirthFoodCost)
 	c.colonists = append(c.colonists, child)
-	c.logf("В деревне родился ребёнок: %s", name)
+	c.births++
+	c.logf("В деревне родился ребёнок: %s", child.Name)
 
 	return index, true
 }

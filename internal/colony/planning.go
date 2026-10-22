@@ -1,6 +1,9 @@
 package colony
 
-import "lifeSimulator/internal/resources"
+import (
+	"lifeSimulator/internal/resources"
+	"time"
+)
 
 func (c *Colony) chooseWork(workerIndex int) resources.Resource {
 	c.mu.Lock()
@@ -8,14 +11,13 @@ func (c *Colony) chooseWork(workerIndex int) resources.Resource {
 
 	food := c.storage[resources.Food]
 	wood := c.storage[resources.Wood]
-	people := c.aliveCountLocked()
 	col := &c.colonists[workerIndex]
-	if col.Dead || col.Age < 18 {
+	if col.Dead || col.Age < c.cfg.Population.AdultAge {
 		return resources.NotSet
 	}
 
-	foodLow := max(10, people*4)
-	foodHigh := max(12, people*12)
+	foodLow := max(10, c.foodReserveLocked(2*time.Minute))
+	foodHigh := max(12, c.foodReserveLocked(6*time.Minute))
 
 	woodLow := houseWoodCost * 2
 	woodHigh := houseWoodCost * 4
@@ -35,7 +37,7 @@ func (c *Colony) chooseWork(workerIndex int) resources.Resource {
 	resource := resources.NotSet
 
 	switch {
-	case food < people:
+	case food <= foodLow:
 		resource = resources.Food
 	case c.restockFood && col.PreferredWork == resources.Food:
 		resource = resources.Food
